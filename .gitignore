@@ -1,0 +1,59 @@
+# ==========================================
+# Go Project Standard Ignores
+# ==========================================
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+coverage.out
+*.out
+
+# Dependency directories (if any are checked in)
+vendor/
+
+# Go workspace files
+go.work
+go.work.sum
+
+# ==========================================
+# FITKIT Generated Artifacts
+# ==========================================
+# Quantization artifacts and generated models
+*.gguf
+*.gguf.quantize-record.json
+
+# Analysis and plan artifacts
+*-analysis.json
+*-profile.json
+*-plan.json
+*-recipe.json
+*-tensor-types.txt
+
+# ==========================================
+# Editor and IDE files
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ==========================================
+# OS specific files
+# ==========================================
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+
+# ==========================================
+# Log files
+# ==========================================
+*.log
