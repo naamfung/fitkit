@@ -19,6 +19,7 @@ fiting -source <BF16.gguf> -imatrix <im.gguf> -target <size> [options]
 | `-upper`            | <br /> | `Q8_0`          | 上界预设（窗口最大类型）                                     |
 | `-policy`           | <br /> | `balanced`      | 规划策略：`balanced` / `original`(greedy) / `random`  |
 | `-mode`             | <br /> | `up`            | 优化方向：`up`（下界为基线、升格高价值张量）/ `down`（上界为基线、从高品质向下削减） |
+| `-no-ladder`        | <br /> | `false`         | 禁用多级阶梯候选生成（仅使用二进位候选：upper→lower直接转换）             |
 | `-out`              | <br /> | 自动              | 输出路径；省略则自动命名                                     |
 | `-runtime`          | <br /> | 本机 build-v17 路径 | llama.cpp 二进制目录                                  |
 | `-plan-only`        | <br /> | `false`         | 只规划并打印类型份额，不做量化                                  |
@@ -86,6 +87,9 @@ fiting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ4_XS -upp
 
 # 只生成计划、看类型份额，不量化
 fiting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ4_XS -upper F16 -mode down -plan-only
+
+# 禁用多级阶梯候选生成（仅使用二进位候选：upper→lower直接转换）
+fiting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ1_S -upper BF16 -mode down -no-ladder
 
 # 指定输出路径
 fiting -source 9b-model.gguf -imatrix im.gguf -target 6GiB -out D:\out\m.gguf

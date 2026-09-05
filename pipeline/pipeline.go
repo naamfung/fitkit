@@ -62,6 +62,11 @@ func execCapture(argv []string) (string, error) {
 // Analyze/Plan/Quantize.
 var AllowRequantize bool
 
+// UseLadder, when true (default), generates multi-step ladder candidates so the
+// optimizer can downgrade/upgrade each tensor part-way between the presets.
+// Set to false (-no-ladder) to restore the binary per-tensor candidate model.
+var UseLadder = true
+
 // RunDryRun runs llama-quantize --dry-run and parses the recipe.
 func RunDryRun(runtimeDir, source, imatrixArg, preset, tensorTypes string) (*Recipe, error) {
 	binary, err := RuntimeBinary(runtimeDir, "llama-quantize")
@@ -157,6 +162,9 @@ func Analyze(source, imatrix, runtimeDir, outDir, lower, upper, imatrixArg strin
 		return nil, fmt.Errorf("pipeline: lower preset %s not below upper preset %s", lower, upper)
 	}
 	cs, err := GenerateUpgradeCandidates(lowerRecipe, upperRecipe, lowerSize, upperSize, profile, mode)
+	if UseLadder {
+		cs, err = GenerateLadderCandidates(lowerRecipe, upperRecipe, lowerSize, upperSize, layout, profile, mode)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -469,21 +477,20 @@ func truncateKVBytes(s string) string {
 	return string(b)
 }
 
-func qtypeParamDistribution(rec *Recipe) map[string]int {
-	dist := map[string]int{}
-	for i := range rec.Tensors {
-		t := rec.Tensors[i]
-		if !t.IsQuantized {
-			continue
-		}
-		e := 1
-		for _, d := range t.Shape {
-			e *= int(d)
-		}
-		k := lowerType(t.DstType)
-		dist[k] += e
+// countsInDistribution reports whether a recipe tensor participates in the
+// qtype parameter distribution. Quantized tensors always count, and so do
+// float tensors the plan explicitly keeps as its baseline (the BF16/F16/F32
+// upper preset of a "down" run — llama-quantize reports those as unchanged
+// when the source already carries the same float type). Only auxiliary float
+// tensors that stay F32 untouched are excluded.
+func countsInDistribution(t Assignment) bool {
+	if t.IsQuantized {
+		return true
 	}
-	return dist
+	if !isFloatPreset(t.DstType) {
+		return true
+	}
+	return lowerType(t.SrcType) != "f32"
 }
 
 func DefaultModelName(sourcePath string) string {
@@ -513,12 +520,12 @@ func ApplyOverrides(lower *Recipe, plan *OptimizationPlan) *Recipe {
 }
 
 // QtypeParameterDistribution counts parameter elements per destination qtype
-// over quantized tensors.
+// over the plan-covered tensors of a recipe (see countsInDistribution).
 func QtypeParameterDistribution(rec *Recipe) map[string]int {
 	dist := map[string]int{}
 	for i := range rec.Tensors {
 		t := rec.Tensors[i]
-		if !t.IsQuantized {
+		if !countsInDistribution(t) {
 			continue
 		}
 		e := 1
@@ -628,6 +635,7 @@ func makeAnalysisDoc(source, imatrix, imatrixArg, runtimeDir, lower, upper, mode
 		"block_span_auto":      AutoBlockSpan(profile),
 		"net_preset_gap_bytes": upperSize.TotalBytes - lowerSize.TotalBytes,
 		"candidate_count":      len(cs.Candidates),
+		"candidate_tensors":    cs.TensorCount,
 		"rejected_count":       len(cs.Rejected),
 		"candidates":           cs.Candidates,
 		"rejected":             cs.Rejected,

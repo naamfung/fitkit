@@ -125,6 +125,7 @@ func main() {
 		fmt.Fprintln(out, "-mode up|down (default up): optimization direction")
 		fmt.Fprintln(out, "  up   : start at the lower preset, upgrade the most valuable tensors toward -target")
 		fmt.Fprintln(out, "  down : start at the upper preset (high quality), downgrade only the least valuable tensors to fit -target")
+		fmt.Fprintln(out, "-no-ladder: disable multi-step ladder candidate generation (binary candidates only)")
 		fmt.Fprintln(out, "-allow-requantize: allow using a pre-quantized source (e.g. Q8_0) as the parent")
 		fmt.Fprintln(out, "Auto output name: <model>-FITKIT-<dominant>-<UP|DOWN>-<size>.2fG-lower<lower>-upper<upper>.gguf")
 		fmt.Fprintln(out, "Output layout: the GGUF and all artifacts go into one subdirectory")
@@ -148,9 +149,11 @@ func main() {
 		planOnly = flag.Bool("plan-only", false, "plan + print qtype shares without quantizing")
 		allowRQ  = flag.Bool("allow-requantize", false, "allow pre-quantized source (e.g. Q8_0) as parent")
 		noArt    = flag.Bool("no-artifacts", false, "do not emit plan/recipe/profile/quantize-record artifacts next to the output")
+		noLadder = flag.Bool("no-ladder", false, "disable multi-step ladder candidate generation (binary candidates only)")
 	)
 	flag.Parse()
 	pipeline.AllowRequantize = *allowRQ
+	pipeline.UseLadder = !*noLadder
 	if *bf == "" || *im == "" || *targets == "" {
 		fmt.Fprintln(os.Stderr, "fiting: -bf, -imatrix, -target required (-out optional)")
 		os.Exit(2)
@@ -192,6 +195,7 @@ func main() {
 	fmt.Printf("  upper: %s\n", *upper)
 	fmt.Printf("  policy: %s\n", *policy)
 	fmt.Printf("  plan-only: %v\n", *planOnly)
+	fmt.Printf("  no-ladder: %v\n", *noLadder)
 
 	fmt.Println("[1/3] analyze")
 	if _, err := pipeline.Analyze(bfAbs, imAbs, *runtime, analysisDir, *lower, *upper, imAbs, false, *mode); err != nil {

@@ -55,6 +55,7 @@ type analysisDoc struct {
 	Candidates      []candDTO `json:"candidates"`
 	Rejected        []rejDTO  `json:"rejected"`
 	CandidatesLower int       `json:"candidate_count,omitempty"`
+	CandidateTensors int      `json:"candidate_tensors,omitempty"`
 	LowerRecipe     recipeDTO `json:"lower_recipe"`
 	UpperRecipe     recipeDTO `json:"upper_recipe"`
 }
@@ -71,6 +72,8 @@ type candDTO struct {
 	Profiled       bool    `json:"profiled"`
 	Block          *int    `json:"block"`
 	Role           string  `json:"role"`
+	Step           int     `json:"step,omitempty"`
+	TotalSteps     int     `json:"total_steps,omitempty"`
 }
 
 type rejDTO struct {
@@ -112,6 +115,7 @@ type Analysis struct {
 	UpperSizeBytes int
 	Candidates     []UpgradeCandidate
 	Rejected       []RejectedTransition
+	TensorCount    int
 	Metadata       *gguf.QuantizationMetadata
 	BlockSpanAuto  int
 	LowerRecipe    *Recipe
@@ -208,10 +212,20 @@ func LoadAnalysis(path string) (*Analysis, error) {
 			DeltaBytes: c.DeltaBytes, Importance: c.Importance, RawImportance: c.RawImportance,
 			ExpectedGain: c.ExpectedGain, UtilityPerByte: c.UtilityPerByte,
 			Profiled: c.Profiled, Role: c.Role, Block: -1,
+			Step: c.Step, TotalSteps: c.TotalSteps,
 		})
 		if c.Block != nil {
 			a.Candidates[len(a.Candidates)-1].Block = *c.Block
 		}
+	}
+	a.TensorCount = doc.CandidateTensors
+	if a.TensorCount <= 0 {
+		// fallback for analysis files predating candidate_tensors
+		seen := map[string]bool{}
+		for _, c := range a.Candidates {
+			seen[c.Tensor] = true
+		}
+		a.TensorCount = len(seen)
 	}
 	for _, r := range doc.Rejected {
 		a.Rejected = append(a.Rejected, RejectedTransition{

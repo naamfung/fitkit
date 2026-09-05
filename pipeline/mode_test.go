@@ -278,3 +278,123 @@ func TestBlockBalancedDownTrimsOvershoot(t *testing.T) {
 		t.Errorf("selected=%d want 3", len(p.Selected))
 	}
 }
+
+// TestQtypeParameterDistributionFloatBaseline verifies that a "down" plan from
+// a float upper preset reports the kept float baseline in the qtype
+// distribution. llama-quantize marks BF16->BF16 as "unchanged", so those kept
+// tensors must still count; the untouched F32 aux tensors stay excluded.
+func TestQtypeParameterDistributionFloatBaseline(t *testing.T) {
+	rec := &Recipe{Tensors: []Assignment{
+		{Name: "blk.0.ffn_up.weight", Shape: []int64{4096, 12288}, SrcType: "BF16", DstType: "IQ1_S", IsQuantized: false}, // selected override
+		{Name: "blk.0.attn_v.weight", Shape: []int64{4096, 2048}, SrcType: "BF16", DstType: "BF16", IsQuantized: false},  // kept baseline
+		{Name: "blk.0.attn_norm.weight", Shape: []int64{4096}, SrcType: "F32", DstType: "F32", IsQuantized: false},       // aux float
+	}}
+	dist := QtypeParameterDistribution(rec)
+	if len(dist) != 2 {
+		t.Fatalf("dist=%v want 2 covered qtypes (IQ1_S, BF16)", dist)
+	}
+	if dist["iq1_s"] != 4096*12288 {
+		t.Errorf("iq1_s elements=%d want %d", dist["iq1_s"], 4096*12288)
+	}
+	if dist["bf16"] != 4096*2048 {
+		t.Errorf("bf16 elements=%d want %d", dist["bf16"], 4096*2048)
+	}
+	if _, ok := dist["f32"]; ok {
+		t.Errorf("unchanged F32 aux tensor must be excluded, dist=%v", dist)
+	}
+}
+
+// ladderTestRecipes builds a two-tensor recipe pair: a big weight that moves
+// BF16→Q4_K along the ladder, and a norm that stays F16 in both presets.
+func ladderTestRecipes() (lower, upper *Recipe) {
+	lower = &Recipe{Tensors: []Assignment{
+		{Name: "blk.0.ffn_up.weight", Shape: []int64{4096, 4096}, DstType: "Q4_K", IsQuantized: true},
+		{Name: "blk.0.attn_norm.weight", Shape: []int64{4096}, DstType: "F16", IsQuantized: true},
+	}}
+	upper = &Recipe{Tensors: []Assignment{
+		{Name: "blk.0.ffn_up.weight", Shape: []int64{4096, 4096}, DstType: "BF16", IsQuantized: false},
+		{Name: "blk.0.attn_norm.weight", Shape: []int64{4096}, DstType: "F16", IsQuantized: false},
+	}}
+	return lower, upper
+}
+
+// TestGenerateLadderCandidatesSteps verifies the ladder segment between BF16 and
+// Q4_K yields the expected contiguous steps (same-bpw neighbours collapse, only
+// strict size decreases survive) with cumulative per-step deltas.
+func TestGenerateLadderCandidatesSteps(t *testing.T) {
+	layout := &gguf.Layout{
+		Alignment: 32,
+		TensorMap: map[string]gguf.TensorInfo{
+			"blk.0.ffn_up.weight":   {Name: "blk.0.ffn_up.weight", Shape: []int64{4096, 4096}},
+			"blk.0.attn_norm.weight": {Name: "blk.0.attn_norm.weight", Shape: []int64{4096}},
+		},
+	}
+	lower, upper := ladderTestRecipes()
+	profile := &ImatrixProfile{}
+	for _, mode := range []string{"down", "up"} {
+		cs, err := GenerateLadderCandidates(lower, upper,
+			&gguf.Prediction{TotalBytes: 100}, &gguf.Prediction{TotalBytes: 200},
+			layout, profile, mode)
+		if err != nil {
+			t.Fatalf("%s: %v", mode, err)
+		}
+		if cs.TensorCount != 1 || len(cs.Candidates) != 4 {
+			t.Fatalf("%s: TensorCount=%d steps=%d want 1/4", mode, cs.TensorCount, len(cs.Candidates))
+		}
+		wantFrom := []string{"bf16", "q8_0", "q6_k", "q5_k"}
+		wantTo := []string{"q8_0", "q6_k", "q5_k", "q4_k"}
+		wantDelta := []int{15728640, 4063232, 2228224, 2097152}
+		for i, c := range cs.Candidates {
+			if c.Tensor != "blk.0.ffn_up.weight" || c.Step != i+1 || c.TotalSteps != 4 {
+				t.Errorf("%s step %d: tensor=%s Step=%d TotalSteps=%d", mode, i, c.Tensor, c.Step, c.TotalSteps)
+			}
+			if c.DeltaBytes != wantDelta[i] {
+				t.Errorf("%s step %d delta=%d want %d", mode, i, c.DeltaBytes, wantDelta[i])
+			}
+			if mode == "down" {
+				if c.FromQtype != wantFrom[i] || c.ToQtype != wantTo[i] {
+					t.Errorf("%s step %d: %s->%s want %s->%s", mode, i, c.FromQtype, c.ToQtype, wantFrom[i], wantTo[i])
+				}
+			} else if c.FromQtype != wantTo[i] || c.ToQtype != wantFrom[i] {
+				t.Errorf("%s step %d: %s->%s want %s->%s", mode, i, c.FromQtype, c.ToQtype, wantTo[i], wantFrom[i])
+			}
+		}
+	}
+}
+
+// TestLadderPrefixConstraint verifies the optimizer never takes a deeper ladder
+// step before its shallower predecessor (the deeper step sorts first here via
+// the delta tie-break), and that multi-step downgrades collapse to one final
+// assignment with the cumulative delta.
+func TestLadderPrefixConstraint(t *testing.T) {
+	mk := func(name string, step, total int, from, to string, delta int) UpgradeCandidate {
+		return UpgradeCandidate{
+			Tensor: name, FromQtype: from, ToQtype: to, DeltaBytes: delta,
+			Importance: 1.0, ExpectedGain: 1.0, UtilityPerByte: 1e-5,
+			Step: step, TotalSteps: total,
+		}
+	}
+	cs := &CandidateSet{
+		Candidates: []UpgradeCandidate{
+			mk("X", 2, 2, "q8_0", "q6_k", 20), // deeper, smaller delta → sorts first
+			mk("X", 1, 2, "bf16", "q8_0", 50),
+		},
+		LowerSizeBytes: 300, UpperSizeBytes: 500, TensorCount: 1,
+		Direction: "down",
+	}
+	// budget = 500-440 = 60: only a prefix (both steps, 70 bytes) reaches it.
+	p := selectPlan(cs, selectionOrder(cs.Candidates, true), 440)
+	if len(p.Selected) != 1 {
+		t.Fatalf("selected=%d want 1 collapsed", len(p.Selected))
+	}
+	c := p.Selected[0]
+	if c.ToQtype != "q6_k" || c.DeltaBytes != 70 {
+		t.Errorf("collapsed to=%s delta=%d want q6_k/70", c.ToQtype, c.DeltaBytes)
+	}
+	if p.PredictedSizeBytes != 430 {
+		t.Errorf("predicted=%d want 430", p.PredictedSizeBytes)
+	}
+	if p.SkippedCount != 0 {
+		t.Errorf("skipped=%d want 0", p.SkippedCount)
+	}
+}

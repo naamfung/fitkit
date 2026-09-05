@@ -30,14 +30,28 @@ func validateCandidates(cands []UpgradeCandidate, lowerSize, target int) error {
 	if target < lowerSize {
 		return fmt.Errorf("pipeline: target %d below lower baseline %d", target, lowerSize)
 	}
-	names := map[string]bool{}
 	for _, c := range cands {
-		if names[c.Tensor] {
-			return fmt.Errorf("pipeline: candidate tensor names must be unique")
-		}
-		names[c.Tensor] = true
 		if c.DeltaBytes <= 0 {
 			return fmt.Errorf("pipeline: all candidate costs must be positive")
+		}
+	}
+	// Ladder steps of one tensor must form the contiguous prefix 1..TotalSteps
+	// so the optimizer can enforce a prefix-constrained selection.
+	steps := map[string]map[int]bool{}
+	for _, c := range cands {
+		if c.TotalSteps <= 1 {
+			continue
+		}
+		if steps[c.Tensor] == nil {
+			steps[c.Tensor] = map[int]bool{}
+		}
+		steps[c.Tensor][c.Step] = true
+	}
+	for tensor, set := range steps {
+		for i := 1; i <= len(set); i++ {
+			if !set[i] {
+				return fmt.Errorf("pipeline: tensor %s ladder steps must be contiguous", tensor)
+			}
 		}
 	}
 	return nil
@@ -76,41 +90,144 @@ func sortedCandidates(cands []UpgradeCandidate, less func(a, b UpgradeCandidate)
 	return out
 }
 
+// normalizeSteps rewrites binary (non-ladder) candidates as single-step ladder
+// candidates so every selection path can treat candidates uniformly.
+func normalizeSteps(cands []UpgradeCandidate) {
+	for i := range cands {
+		if cands[i].TotalSteps <= 1 {
+			cands[i].Step = 1
+			cands[i].TotalSteps = 1
+		}
+	}
+}
+
+// stepEligible reports whether ladder step c may be taken when depth steps of
+// its tensor are already taken (a prefix constraint: step k needs steps 1..k-1).
+func stepEligible(c UpgradeCandidate, depth int) bool {
+	return depth == c.Step-1
+}
+
+// collapseSteps merges each tensor's selected ladder steps into one final-state
+// candidate: the tensor's deepest reached qtype with cumulative delta, expected
+// gain and utility. Downstream (overrides, recipe, tensor-types, shares) only
+// sees the final per-tensor assignment.
+func collapseSteps(selected []UpgradeCandidate) []UpgradeCandidate {
+	first := map[string]UpgradeCandidate{}
+	deepest := map[string]UpgradeCandidate{}
+	delta := map[string]int{}
+	for _, c := range selected {
+		if _, ok := first[c.Tensor]; !ok {
+			first[c.Tensor] = c
+		}
+		if d, ok := deepest[c.Tensor]; !ok || c.Step > d.Step {
+			deepest[c.Tensor] = c
+		}
+		delta[c.Tensor] += c.DeltaBytes
+	}
+	out := make([]UpgradeCandidate, 0, len(first))
+	for tensor, f := range first {
+		// Single-step (binary) transitions collapse to themselves exactly,
+		// preserving the generated expected gain and utility.
+		if f.TotalSteps == 1 {
+			out = append(out, f)
+			continue
+		}
+		d := deepest[tensor]
+		bits := 0.0
+		if fromBPW, err := qtypeBPW(f.FromQtype); err == nil {
+			if toBPW, err := qtypeBPW(d.ToQtype); err == nil {
+				bits = fromBPW - toBPW
+				if bits < 0 {
+					bits = -bits
+				}
+			}
+		}
+		eg := f.Importance * bits
+		util := 0.0
+		if delta[tensor] > 0 {
+			util = eg / float64(delta[tensor])
+		}
+		out = append(out, UpgradeCandidate{
+			Tensor: tensor, FromQtype: f.FromQtype, ToQtype: d.ToQtype,
+			DeltaBytes: delta[tensor], Importance: f.Importance, RawImportance: f.RawImportance,
+			ExpectedGain: eg, UtilityPerByte: util,
+			Profiled: f.Profiled, Block: f.Block, Role: f.Role,
+			Step: d.Step, TotalSteps: f.TotalSteps,
+		})
+	}
+	sortUpgrade(out, func(a, b UpgradeCandidate) bool { return a.Tensor < b.Tensor })
+	return out
+}
+
 // selectPlan builds the size-exact plan for the given selection sweep order.
 // In "up" mode the lower baseline grows by adding upgrades up to target; in
 // "down" mode the upper baseline (high quality) is shrunk by downgrading the
-// least-harmful selected tensors until the target fits.
+// least-harmful selected tensors until the target fits. Ladder steps are taken
+// prefix-wise (a tensor may only be moved part-way along its ladder), then
+// collapsed to one final assignment per tensor.
 func selectPlan(cs *CandidateSet, ordered []UpgradeCandidate, target int) *OptimizationPlan {
+	normalizeSteps(cs.Candidates)
+	normalizeSteps(ordered)
 	if cs.Direction == "down" {
 		budget := cs.UpperSizeBytes - target
+		depth := map[string]int{}
 		var selected []UpgradeCandidate
 		saved := 0
-		for _, c := range ordered {
-			if saved >= budget {
+		for saved < budget {
+			progressed := false
+			for _, c := range ordered {
+				if saved >= budget {
+					break
+				}
+				if depth[c.Tensor] >= c.TotalSteps || !stepEligible(c, depth[c.Tensor]) {
+					continue
+				}
+				depth[c.Tensor]++
+				selected = append(selected, c)
+				saved += c.DeltaBytes
+				progressed = true
+			}
+			if !progressed {
 				break
 			}
-			selected = append(selected, c)
+		}
+		collapsed := collapseSteps(selected)
+		saved = 0
+		for _, c := range collapsed {
 			saved += c.DeltaBytes
 		}
 		return &OptimizationPlan{
 			SchemaVersion: 1, TargetBytes: target, LowerSizeBytes: cs.LowerSizeBytes,
 			PredictedSizeBytes: cs.UpperSizeBytes - saved, UnusedBytes: budget - saved,
-			Selected: selected, SkippedCount: len(cs.Candidates) - len(selected),
+			Selected: collapsed, SkippedCount: cs.TensorCount - len(collapsed),
 		}
 	}
 
 	remaining := target - cs.LowerSizeBytes
+	depth := map[string]int{}
 	var selected []UpgradeCandidate
-	for _, c := range ordered {
-		if c.DeltaBytes <= remaining {
-			selected = append(selected, c)
-			remaining -= c.DeltaBytes
+	for remaining > 0 {
+		progressed := false
+		for _, c := range ordered {
+			if depth[c.Tensor] >= c.TotalSteps || !stepEligible(c, depth[c.Tensor]) {
+				continue
+			}
+			if c.DeltaBytes <= remaining {
+				depth[c.Tensor]++
+				remaining -= c.DeltaBytes
+				selected = append(selected, c)
+				progressed = true
+			}
+		}
+		if !progressed {
+			break
 		}
 	}
+	collapsed := collapseSteps(selected)
 	return &OptimizationPlan{
 		SchemaVersion: 1, TargetBytes: target, LowerSizeBytes: cs.LowerSizeBytes,
 		PredictedSizeBytes: target - remaining, UnusedBytes: remaining,
-		Selected: selected, SkippedCount: len(cs.Candidates) - len(selected),
+		Selected: collapsed, SkippedCount: cs.TensorCount - len(collapsed),
 	}
 }
 
@@ -142,6 +259,7 @@ func optimizeBlockBalanced(target int, cs *CandidateSet, blockSpan int) (*Optimi
 	if err := validateCandidates(cs.Candidates, cs.LowerSizeBytes, target); err != nil {
 		return nil, err
 	}
+	normalizeSteps(cs.Candidates)
 	groups := map[int][]UpgradeCandidate{}
 	for _, c := range cs.Candidates {
 		if c.Block >= 0 {
@@ -165,11 +283,11 @@ func optimizeBlockBalanced(target int, cs *CandidateSet, blockSpan int) (*Optimi
 		return selectionOrder(cands, down)
 	}
 
-	selectedMap := map[string]bool{}
+	depth := map[string]int{}
 	var selected []UpgradeCandidate
 	if down {
 		// Remove bytes: each group downgrades its least-harmful tensors to hit
-		// its share of the total budget, then a leftover pass catches remainder.
+		// its share of the total budget, then a leftover pass catches the rest.
 		budget := cs.UpperSizeBytes - target
 		quota := budget / len(groupIDs)
 		remQuota := budget % len(groupIDs)
@@ -178,13 +296,24 @@ func optimizeBlockBalanced(target int, cs *CandidateSet, blockSpan int) (*Optimi
 			if pos == len(groupIDs)-1 {
 				groupNeed += remQuota
 			}
-			for _, c := range order(groups[gid]) {
-				if groupNeed <= 0 {
+			ordered := order(groups[gid])
+			for groupNeed > 0 {
+				progressed := false
+				for _, c := range ordered {
+					if groupNeed <= 0 {
+						break
+					}
+					if depth[c.Tensor] >= c.TotalSteps || !stepEligible(c, depth[c.Tensor]) {
+						continue
+					}
+					depth[c.Tensor]++
+					selected = append(selected, c)
+					groupNeed -= c.DeltaBytes
+					progressed = true
+				}
+				if !progressed {
 					break
 				}
-				selected = append(selected, c)
-				selectedMap[c.Tensor] = true
-				groupNeed -= c.DeltaBytes
 			}
 		}
 		saved := 0
@@ -194,17 +323,32 @@ func optimizeBlockBalanced(target int, cs *CandidateSet, blockSpan int) (*Optimi
 		remaining := budget - saved
 		var leftovers []UpgradeCandidate
 		for _, c := range cs.Candidates {
-			if !selectedMap[c.Tensor] {
+			if depth[c.Tensor] < c.Step {
 				leftovers = append(leftovers, c)
 			}
 		}
-		for _, c := range order(leftovers) {
-			if remaining <= 0 {
+		for remaining > 0 {
+			progressed := false
+			for _, c := range order(leftovers) {
+				if remaining <= 0 {
+					break
+				}
+				if depth[c.Tensor] >= c.TotalSteps || !stepEligible(c, depth[c.Tensor]) {
+					continue
+				}
+				depth[c.Tensor]++
+				selected = append(selected, c)
+				remaining -= c.DeltaBytes
+				progressed = true
+			}
+			if !progressed {
 				break
 			}
-			selected = append(selected, c)
-			selectedMap[c.Tensor] = true
-			remaining -= c.DeltaBytes
+		}
+		collapsed := collapseSteps(selected)
+		saved = 0
+		for _, c := range collapsed {
+			saved += c.DeltaBytes
 		}
 		// Trim back: the per-group quotas can collectively overshoot the budget
 		// (when a group's total savings barely exceed its quota it consumes every
@@ -212,30 +356,30 @@ func optimizeBlockBalanced(target int, cs *CandidateSet, blockSpan int) (*Optimi
 		// valuable selected tensors to the upper preset while the remaining
 		// savings still cover the budget, so only what the target strictly
 		// requires is sacrificed.
-		saved = 0
-		for _, c := range selected {
-			saved += c.DeltaBytes
-		}
 		if saved > budget {
-			for _, c := range sortedCandidates(selected, lessUtilexists) {
+			removed := map[string]bool{}
+			for _, c := range sortedCandidates(collapsed, lessUtilexists) {
 				if saved-c.DeltaBytes < budget {
 					break
 				}
 				saved -= c.DeltaBytes
-				delete(selectedMap, c.Tensor)
+				removed[c.Tensor] = true
 			}
-			selected = nil
-			for _, c := range cs.Candidates {
-				if selectedMap[c.Tensor] {
-					selected = append(selected, c)
+			if len(removed) > 0 {
+				var kept []UpgradeCandidate
+				for _, c := range collapsed {
+					if !removed[c.Tensor] {
+						kept = append(kept, c)
+					}
 				}
+				collapsed = kept
 			}
 		}
 		remaining = budget - saved
 		return &OptimizationPlan{
 			SchemaVersion: 1, TargetBytes: target, LowerSizeBytes: cs.LowerSizeBytes,
 			PredictedSizeBytes: cs.UpperSizeBytes - (budget - remaining), UnusedBytes: remaining,
-			Selected: selected, SkippedCount: len(cs.Candidates) - len(selected),
+			Selected: collapsed, SkippedCount: cs.TensorCount - len(collapsed),
 		}, nil
 	}
 
@@ -247,11 +391,25 @@ func optimizeBlockBalanced(target int, cs *CandidateSet, blockSpan int) (*Optimi
 		if pos == len(groupIDs)-1 {
 			groupRemaining += remQuota
 		}
-		for _, c := range order(groups[gid]) {
-			if c.DeltaBytes <= groupRemaining {
-				selected = append(selected, c)
-				selectedMap[c.Tensor] = true
-				groupRemaining -= c.DeltaBytes
+		ordered := order(groups[gid])
+		for groupRemaining > 0 {
+			progressed := false
+			for _, c := range ordered {
+				if groupRemaining <= 0 {
+					break
+				}
+				if depth[c.Tensor] >= c.TotalSteps || !stepEligible(c, depth[c.Tensor]) {
+					continue
+				}
+				if c.DeltaBytes <= groupRemaining {
+					depth[c.Tensor]++
+					selected = append(selected, c)
+					groupRemaining -= c.DeltaBytes
+					progressed = true
+				}
+			}
+			if !progressed {
+				break
 			}
 		}
 	}
@@ -263,19 +421,34 @@ func optimizeBlockBalanced(target int, cs *CandidateSet, blockSpan int) (*Optimi
 	remaining := budget - spent
 	var leftovers []UpgradeCandidate
 	for _, c := range cs.Candidates {
-		if !selectedMap[c.Tensor] {
+		if depth[c.Tensor] < c.Step {
 			leftovers = append(leftovers, c)
 		}
 	}
-	for _, c := range order(leftovers) {
-		if c.DeltaBytes <= remaining {
-			selected = append(selected, c)
-			remaining -= c.DeltaBytes
+	for remaining > 0 {
+		progressed := false
+		for _, c := range order(leftovers) {
+			if remaining <= 0 {
+				break
+			}
+			if depth[c.Tensor] >= c.TotalSteps || !stepEligible(c, depth[c.Tensor]) {
+				continue
+			}
+			if c.DeltaBytes <= remaining {
+				depth[c.Tensor]++
+				selected = append(selected, c)
+				remaining -= c.DeltaBytes
+				progressed = true
+			}
+		}
+		if !progressed {
+			break
 		}
 	}
+	collapsed := collapseSteps(selected)
 	return &OptimizationPlan{
 		SchemaVersion: 1, TargetBytes: target, LowerSizeBytes: cs.LowerSizeBytes,
 		PredictedSizeBytes: target - remaining, UnusedBytes: remaining,
-		Selected: selected, SkippedCount: len(cs.Candidates) - len(selected),
+		Selected: collapsed, SkippedCount: cs.TensorCount - len(collapsed),
 	}, nil
 }

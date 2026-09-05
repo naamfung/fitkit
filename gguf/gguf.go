@@ -730,6 +730,35 @@ func PredictOutputMetadataSize(layout *Layout, meta *QuantizationMetadata) (int,
 	return align(raw, DefaultAlignment), nil
 }
 
+// TensorPaddedSize computes the payload and padded byte size of a single source
+// tensor when encoded as dstType. ok is false when the tensor or the qtype is
+// unknown, or when ne0 is not divisible by the qtype's block size (the type
+// cannot encode that tensor).
+func TensorPaddedSize(layout *Layout, name string, dstType string) (payload, padded int, ok bool) {
+	src, found := layout.TensorMap[name]
+	if !found {
+		return 0, 0, false
+	}
+	dstLower := toLower(dstType)
+	traits, known := GGMLTypeTraits[dstLower]
+	if !known {
+		return 0, 0, false
+	}
+	blockSize := traits[0]
+	typeSize := traits[1]
+	ne0 := int(CanonicalShape(src.Shape)[0])
+	if ne0%blockSize != 0 {
+		return 0, 0, false
+	}
+	rows := 1
+	for _, d := range CanonicalShape(src.Shape)[1:] {
+		rows *= int(d)
+	}
+	payload = (ne0 / blockSize) * typeSize * rows
+	padded = align(payload, DefaultAlignment)
+	return payload, padded, true
+}
+
 // PredictQuantizedSize predicts the exact output GGUF size for a recipe.
 // recipe maps tensor name → dst_type (lowercase, e.g. "q4_k").
 func PredictQuantizedSize(layout *Layout, recipe map[string]string, meta *QuantizationMetadata) (*Prediction, error) {
@@ -761,30 +790,19 @@ func PredictQuantizedSize(layout *Layout, recipe map[string]string, meta *Quanti
 
 	sizes := make([]TensorSize, 0, len(recipe))
 	for _, name := range sortedNames {
-		src := sourceTensors[name]
 		dstType := recipe[name]
-		dstLower := toLower(dstType)
-
-		traits, ok := GGMLTypeTraits[dstLower]
+		payload, padded, ok := TensorPaddedSize(layout, name, dstType)
 		if !ok {
-			return nil, newError("Unsupported destination qtype: %s", dstType)
+			dstLower := toLower(dstType)
+			traits, known := GGMLTypeTraits[dstLower]
+			if !known {
+				return nil, newError("Unsupported destination qtype: %s", dstType)
+			}
+			ne0 := int(CanonicalShape(sourceTensors[name].Shape)[0])
+			return nil, newError("Tensor %s ne0=%d is not divisible by %s block size %d", name, ne0, dstLower, traits[0])
 		}
-		blockSize := traits[0]
-		typeSize := traits[1]
-
-		cs := CanonicalShape(src.Shape)
-		ne0 := int(cs[0])
-		if ne0%blockSize != 0 {
-			return nil, newError("Tensor %s ne0=%d is not divisible by %s block size %d", src.Name, ne0, dstLower, blockSize)
-		}
-		rows := 1
-		for _, d := range cs[1:] {
-			rows *= int(d)
-		}
-		payload := (ne0 / blockSize) * typeSize * rows
-		padded := align(payload, DefaultAlignment)
 		sizes = append(sizes, TensorSize{
-			Name: name, Qtype: dstLower, PayloadBytes: payload, PaddedBytes: padded,
+			Name: name, Qtype: toLower(dstType), PayloadBytes: payload, PaddedBytes: padded,
 		})
 	}
 
