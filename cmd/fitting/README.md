@@ -1,11 +1,11 @@
-# fiting — 纯 Golang 版 FIT-GGUF
+# fitting — 纯 Golang 版 FIT-GGUF
 
-`fiting` 在纯 Go 内完成 **analyze → plan → quantize** 全流程，仅调用 `llama-quantize`，**不依赖 Python**。
+`fitting` 在纯 Go 内完成 **analyze → plan → quantize** 全流程，仅调用 `llama-quantize`，**不依赖 Python**。
 
 ## 用法
 
 ```
-fiting -source <BF16.gguf> -imatrix <im.gguf> -target <size> [options]
+fitting -source <BF16.gguf> -imatrix <im.gguf> -target <size> [options]
 ```
 
 ## 参数
@@ -77,22 +77,22 @@ GGUF 与全部产物统一放入以输出名（去 `.gguf`）命名的子目录�
 
 ```powershell
 # 出 4.88GiB，Q3_K_M→BF16 窗口，向上取值（默认 mode=up）
-fiting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -upper BF16
+fitting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -upper BF16
 
 # 出 4.88GiB，向上取值模式（下界为基线，升格高价值张量）
-fiting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ4_XS -upper F16 -mode up
+fitting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ4_XS -upper F16 -mode up
 
 # 出 4.88GiB，向下取值模式（上界 F16 为基线，从高品质向下削减）
-fiting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ4_XS -upper F16 -mode down
+fitting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ4_XS -upper F16 -mode down
 
 # 只生成计划、看类型份额，不量化
-fiting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ4_XS -upper F16 -mode down -plan-only
+fitting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ4_XS -upper F16 -mode down -plan-only
 
 # 禁用多级阶梯候选生成（仅使用二进位候选：upper→lower直接转换）
-fiting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ1_S -upper BF16 -mode down -no-ladder
+fitting -source 9b-model.gguf -imatrix im.gguf -target 4.88GiB -lower IQ1_S -upper BF16 -mode down -no-ladder
 
 # 指定输出路径
-fiting -source 9b-model.gguf -imatrix im.gguf -target 6GiB -out D:\out\m.gguf
+fitting -source 9b-model.gguf -imatrix im.gguf -target 6GiB -out D:\out\m.gguf
 ```
 
 ## 退出码
@@ -103,4 +103,4 @@ fiting -source 9b-model.gguf -imatrix im.gguf -target 6GiB -out D:\out\m.gguf
 
 - `2`：参数缺失 / 目标超出窗口 `[下界, 上界]`
 
-运行 `fiting -h` 可查看内嵌帮助。
+运行 `fitting -h` 可查看内嵌帮助。

@@ -14,7 +14,7 @@ build() {
     "$GO" build -trimpath -o "bin/$name.exe" "./cmd/$cmd"
 }
 
-build fiting      fiting
+build fitting    fitting
 build fitfidelity fitfidelity
 build fitcalibrate fitcalibrate
 build fitregistry fitregistry

@@ -1,4 +1,4 @@
-// Command fiting is the pure-Go FIT-GGUF driver.  It performs analyze → plan →
+// Command fitting is the pure-Go FIT-GGUF driver.  It performs analyze → plan →
 // quantize entirely in Go, invoking only llama-quantize (never Python).
 package main
 
@@ -120,10 +120,10 @@ func dirTag(mode string) string {
 func main() {
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		fmt.Fprintln(out, "fiting — pure-Go FIT-GGUF driver: analyze → plan → quantize (only calls llama-quantize; no Python)")
+		fmt.Fprintln(out, "fitting — pure-Go FIT-GGUF driver: analyze → plan → quantize (only calls llama-quantize; no Python)")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "Usage:")
-		fmt.Fprintln(out, "  fiting -source <BF16.gguf> -imatrix <im.gguf> -target <size> [options]")
+		fmt.Fprintln(out, "  fitting -source <BF16.gguf> -imatrix <im.gguf> -target <size> [options]")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "Flags:")
 		flag.PrintDefaults()
@@ -174,7 +174,7 @@ func main() {
 	pipeline.AllowRequantize = *allowRQ
 	pipeline.UseLadder = !*noLadder
 	if *bf == "" || *im == "" || (*targets == "" && *fit == "") {
-		fmt.Fprintln(os.Stderr, "fiting: -bf, -imatrix and one of -target/-fit required (-out optional)")
+		fmt.Fprintln(os.Stderr, "fitting: -bf, -imatrix and one of -target/-fit required (-out optional)")
 		os.Exit(2)
 	}
 	bfAbs, _ := filepath.Abs(*bf)
@@ -362,7 +362,7 @@ func printShares(dist map[string]int) {
 }
 
 func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "fiting:", err)
+	fmt.Fprintln(os.Stderr, "fitting:", err)
 	os.Exit(1)
 }
 
