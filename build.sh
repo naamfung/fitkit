@@ -16,6 +16,8 @@ build() {
 
 build fiting      fiting
 build fitfidelity fitfidelity
+build fitcalibrate fitcalibrate
+build fitregistry fitregistry
 build fitdry      fitdry
 build fitpoc      fitpoc
 build plancheck   plancheck
