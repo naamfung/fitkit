@@ -10,8 +10,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"fitgo/fidelity"
-	"fitgo/pipeline"
+	"fitting/fidelity"
+	"fitting/pipeline"
 )
 
 func step(name string, err error) bool {
@@ -91,7 +91,7 @@ func main() {
 		w := windows[0]
 		mid := (w.LowerSize + w.UpperSize) / 2
 		plan, pred, err := pipeline.Plan(filepath.Join(w.AnalysisPath, "analysis.json"),
-			filepath.Join(*outDir, "plan"), mid, "balanced", "auto", *modelName)
+			filepath.Join(*outDir, "plan"), mid, "balanced", "auto", *modelName, "")
 		if err != nil {
 			return err
 		}
@@ -120,8 +120,8 @@ func main() {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("          tier=%s  kl_anchor=%.3f  same_top_floor=%.4f\n",
-			c.Tier, c.KLAnchor, c.SameTopFloor)
+		fmt.Printf("          tier=%s  kl_anchor=%.3f  same_top_reference=%.4f\n",
+			c.Tier, c.KLAnchor, c.SameTopReference)
 		return nil
 	})
 }

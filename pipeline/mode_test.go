@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	gguf "fitgo/gguf"
+	gguf "fitting/gguf"
 )
 
 // Tolerated "same type" tensor exercises the no-transition path: it must not

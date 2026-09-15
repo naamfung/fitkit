@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"os"
 
-	"fitgo/gguf"
+	"fitting/gguf"
 )
 
 type analysisDoc struct {

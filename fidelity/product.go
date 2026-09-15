@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"fitgo/gguf"
-	"fitgo/pipeline"
+	"fitting/gguf"
+	"fitting/pipeline"
 )
 
 // Budgets is the search budget gate: Normal <= 8, Precise <= 16.
@@ -46,7 +46,7 @@ func ExpandPresetLadder(ladder []string, source, imatrix, runtime, analysesDir, 
 }
 
 // PlanExactSize finds a byte target whose plan delivers exactly targetSize.
-func PlanExactSize(analysisPath string, targetSize, upperBound int, modelName string, outPrefix string, maxSteps int) (string, error) {
+func PlanExactSize(analysisPath string, targetSize, upperBound int, modelName string, refineProfile string, outPrefix string, maxSteps int) (string, error) {
 	if maxSteps <= 0 {
 		maxSteps = 40
 	}
@@ -56,7 +56,7 @@ func PlanExactSize(analysisPath string, targetSize, upperBound int, modelName st
 		high = targetSize + 1
 	}
 	tryPlan := func(target int) (int, bool) {
-		opt, pred, err := pipeline.Plan(analysisPath, outPrefix, target, "balanced", "auto", modelName)
+		opt, pred, err := pipeline.Plan(analysisPath, outPrefix, target, "balanced", "auto", modelName, refineProfile)
 		if err != nil {
 			return 0, false
 		}
@@ -115,15 +115,14 @@ func FidelitySearchProduct(opts ProductOptions) (map[string]any, error) {
 	}
 	refManifest := opts.ReferenceManifestPath
 	if refManifest == "" {
-		var candidates []string
-		if matches, err := filepath.Glob(filepath.Join(filepath.Dir(opts.FreezePath), "reference-manifest-*.json")); err == nil {
-			candidates = matches
-		}
-		sort.Strings(candidates)
-		if len(candidates) == 1 {
-			refManifest = candidates[0]
-		} else {
-			return nil, &EvalProvenanceError{msg: "reference_manifest_path is required (no unique reference-manifest-*.json found next to the freeze file)"}
+		// The manifest belongs to the model, not to the freeze: one freeze
+		// covers every model, and each model's bundle carries its own manifest
+		// beside its references (the `fit calibrate` layout). Only fall back to
+		// the freeze directory for the v0.2 bootstrap layout.
+		var err error
+		refManifest, err = DiscoverReferenceManifest(opts.RefsDir, opts.FreezePath)
+		if err != nil {
+			return nil, err
 		}
 	}
 	provenance, err := VerifyEvalV1Provenance(opts.RefsDir, opts.EvalDataDir, opts.FreezePath, refManifest, "")
@@ -131,20 +130,23 @@ func FidelitySearchProduct(opts ProductOptions) (map[string]any, error) {
 		return nil, err
 	}
 
-	sourceSHA256 := ""
-	contract, err := ResolveContract(modelName, tierKey, opts.GuardRegistry, "")
+	// The references were generated from specific BF16 weights. Quantizing
+	// different weights against them yields meaningless KL numbers, so this
+	// binding is checked unconditionally — since Contract v2 it can no longer
+	// ride along on "a Guard pins the weights", because a tier no longer
+	// requires a Guard at all.
+	sourceSHA256, err := SHA256File(opts.Source)
 	if err != nil {
-		sourceSHA256, _ = SHA256File(opts.Source)
-		contract, err = ResolveContract(modelName, tierKey, opts.GuardRegistry, sourceSHA256)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
-	if sourceSHA256 != "" && provenance.SourceBF16GGUFSHA256 != "" &&
-		!strings.EqualFold(provenance.SourceBF16GGUFSHA256, sourceSHA256) {
+	if !strings.EqualFold(provenance.SourceBF16GGUFSHA256, sourceSHA256) {
 		return nil, &EvalProvenanceError{msg: fmt.Sprintf(
-			"guard weights binding disagrees with the reference manifest: %s != %s",
+			"the source GGUF and the reference manifest disagree on the BF16 weights: %s != %s — the references belong to different weights",
 			sourceSHA256, provenance.SourceBF16GGUFSHA256)}
+	}
+	contract, err := ResolveContract(modelName, tierKey, opts.GuardRegistry, sourceSHA256)
+	if err != nil {
+		return nil, err
 	}
 
 	var analysisPaths []string
@@ -191,10 +193,14 @@ func FidelitySearchProduct(opts ProductOptions) (map[string]any, error) {
 		}
 	}
 
+	// Historical manifests may use a shorter naming convention than the guard
+	// identifier, so the seed prefix is explicit — but the default is a
+	// match-all, because the manifest and log directory handed in here already
+	// scope the search to one model's bundle. Cross-model contamination cannot
+	// ride in on that: a seed is admitted only when the provenance sidecar
+	// attests the live frozen contract AND the exact reference-manifest file
+	// being used, and only when its name appears in the given size manifest.
 	seedPrefix := opts.SeedPrefix
-	if seedPrefix == "" {
-		seedPrefix = modelName + "-"
-	}
 	exclude := map[string]bool{}
 	for _, n := range opts.ExcludeSeeds {
 		exclude[n] = true
@@ -257,17 +263,30 @@ func FidelitySearchProduct(opts ProductOptions) (map[string]any, error) {
 		}
 		prefix := filepath.Join(opts.OutDir, "final-plan")
 		finalPrefix, err := PlanExactSize(filepath.Join(analysisDir, "analysis.json"),
-			bestSize, windowUpper, modelName, prefix, 40)
+			bestSize, windowUpper, modelName, opts.RefineProfile, prefix, 40)
 		if err != nil {
 			return nil, err
 		}
 		tensorTypes = finalPrefix + "-tensor-types.txt"
 	}
 
+	// The suffix must name what the file primarily is, and it must be a
+	// nameable GGUF preset (see pipeline.PrimaryTypeFromPlan). A deliverable
+	// whose primary type cannot be established would ship under a name that
+	// does not describe it, so it fails instead.
+	primaryType, err := primaryTypeForArtifact(filepath.Join(analysisDir, "analysis.json"), tensorTypes)
+	if err != nil {
+		return nil, err
+	}
+	if primaryType == "" {
+		return nil, fmt.Errorf("cannot determine the primary type for %s-FITKIT-%s at %d bytes",
+			modelName, strings.ToUpper(tierKey), bestSize)
+	}
+
 	outputPath := opts.Output
 	if outputPath == "" {
 		outputPath = filepath.Join(opts.OutDir,
-			fmt.Sprintf("%s-FITKIT-%s-%.2fGiB.gguf", modelName, strings.ToUpper(tierKey), float64(bestSize)/(1<<30)))
+			fmt.Sprintf("%s-FITKIT-%s-%.2fGiB-%s.gguf", modelName, strings.ToUpper(tierKey), float64(bestSize)/(1<<30), primaryType))
 	}
 	actual, refinalized, err := pipeline.Quantize(
 		filepath.Join(analysisDir, "analysis.json"), tensorTypes, outputPath,
@@ -310,7 +329,8 @@ func FidelitySearchProduct(opts ProductOptions) (map[string]any, error) {
 		"path":                 outputPath,
 		"size_bytes":           actual,
 		"g2_delta":             actual - refinalized,
-		"naming":               fmt.Sprintf("%s-FITKIT-%s-<size>-<primary-qtype>.gguf", modelName, strings.ToUpper(tierKey)),
+		"primary_type":         primaryType,
+		"naming":               fmt.Sprintf("%s-FITKIT-%s-<size>GiB-<type>.gguf", modelName, strings.ToUpper(tierKey)),
 		"search_tolerance_mib": opts.ToleranceBytes / (1024 * 1024),
 		"active_constraint":    summary["active_constraint"],
 		"healthy_frontier":     true,
@@ -364,12 +384,100 @@ func writeSummaryProduct(outDir, tier string, summary map[string]any) error {
 }
 
 func bestAnalysis(bestSize int, windows []Window) string {
+	var containing []Window
 	for _, w := range windows {
 		if w.LowerSize <= bestSize && bestSize <= w.UpperSize {
+			containing = append(containing, w)
+		}
+	}
+	if len(containing) == 0 {
+		return ""
+	}
+	// Planning is upgrade-only from a window's lower preset: a size exactly on a
+	// shared preset boundary is reproducible from the window where it is the
+	// LOWER bound (recipe = that preset, zero upgrades), but as the other
+	// window's upper bound it would need every upgrade in the gap to fit, and
+	// the tail of a gap usually admits none. Prefer the reproducible side.
+	for _, w := range containing {
+		if w.LowerSize == bestSize {
 			return w.AnalysisPath
 		}
 	}
-	return ""
+	return containing[0].AnalysisPath
+}
+
+// parseTensorTypes parses a tensor-types file (one "^tensor$=qtype" line per
+// override) into a tensor→qtype map.
+func parseTensorTypes(path string) (map[string]string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	over := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		idx := strings.Index(line, "$=")
+		if idx < 2 || !strings.HasPrefix(line, "^") {
+			return nil, fmt.Errorf("malformed tensor-types line: %q", line)
+		}
+		over[line[1:idx]] = line[idx+2:]
+	}
+	return over, nil
+}
+
+// primaryTypeForArtifact computes the deliverable's primary type from its
+// window analysis and tensor-types file — the naming evidence equivalent of
+// upstream primary_type_from_plan(plan_record).
+func primaryTypeForArtifact(analysisPath, tensorTypesPath string) (string, error) {
+	a, err := pipeline.LoadAnalysis(analysisPath)
+	if err != nil {
+		return "", err
+	}
+	over, err := parseTensorTypes(tensorTypesPath)
+	if err != nil {
+		return "", err
+	}
+	if len(over) == 0 {
+		return strings.ToUpper(a.LowerPreset), nil
+	}
+	plan := &pipeline.OptimizationPlan{}
+	for name, q := range over {
+		plan.Selected = append(plan.Selected, pipeline.UpgradeCandidate{Tensor: name, ToQtype: q})
+	}
+	rec := pipeline.ApplyOverrides(a.LowerRecipe, plan)
+	dist := pipeline.QtypeParameterDistribution(rec)
+	return pipeline.PrimaryTypeFromPlan(a.LowerPreset, len(over), pipeline.DominantQtype(dist)), nil
+}
+
+// DiscoverReferenceManifest locates the reference manifest for a model,
+// mirroring upstream discover_reference_manifest (0.3.2): the model bundle
+// layout first (references/reference-manifest.json, then up one level), with
+// the v0.2 freeze-adjacent reference-manifest-*.json glob as a last-resort
+// fallback that reports ambiguity instead of silently picking one.
+func DiscoverReferenceManifest(refsDir, freezePath string) (string, error) {
+	for _, cand := range []string{
+		filepath.Join(refsDir, "references", "reference-manifest.json"),
+		filepath.Join(refsDir, "reference-manifest.json"),
+	} {
+		if fileExists(cand) {
+			return cand, nil
+		}
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(freezePath), "reference-manifest-*.json"))
+	if err != nil {
+		matches = nil
+	}
+	sort.Strings(matches)
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return "", &EvalProvenanceError{msg: fmt.Sprintf("ambiguous reference manifest: %v", matches)}
+	}
+	return "", &EvalProvenanceError{msg: "reference_manifest_path is required (no reference-manifest.json found beside the references or next to the freeze file)"}
 }
 
 func fintMap(v any) int {

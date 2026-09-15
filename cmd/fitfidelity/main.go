@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"fitgo/fidelity"
+	"fitting/fidelity"
 )
 
 type stringList []string
@@ -56,7 +56,7 @@ func main() {
 		runtime        = flag.String("runtime", "", "Directory containing the pinned llama.cpp binaries")
 		refsDir        = flag.String("refs-dir", "", "Directory of bf16-<domain>.kld references")
 		evalDataDir    = flag.String("eval-data-dir", "", "Directory of kl-eval domain slices")
-		guardRegistry  = flag.String("guard-registry", "", "Guard Profile registry directory")
+		guardRegistry  = flag.String("guard-registry", "", "Optional Guard Profile registry: only supplies the informational Same-top reference (KL-only gate since v0.3)")
 		tier           = flag.String("tier", "", "Fidelity tier to satisfy (quality|balanced|compact|mini)")
 		presetLadder   = flag.String("preset-ladder", "", "Comma-separated presets in ascending-size order")
 		refineProfile  = flag.String("refine-profile", "", "Refine Profile JSON (v0.2 band-conditional)")
@@ -70,7 +70,7 @@ func main() {
 		output         = flag.String("output", "", "Final artifact path")
 		threads        = flag.Int("threads", 16, "Evaluator threads")
 		evalParallel   = flag.Int("eval-parallel", 1, "Eval domains in parallel: bare -eval-parallel = 2; -eval-parallel N = N; absent = 1 (serial)")
-		seedPrefix     = flag.String("seed-prefix", "", "Manifest/log name prefix for prior points")
+		seedPrefix     = flag.String("seed-prefix", "", "Manifest/log name prefix for prior points (default: match every name in -manifest/-logs-dir)")
 		skipHash       = flag.Bool("skip-hash", false, "Skip SHA-256 of source during auto-analyze")
 		freeze         = flag.String("freeze", "experiments/2026-09-02-eval-v1/FREEZE.json", "Frozen eval-v1 FREEZE.json")
 		referenceManif = flag.String("reference-manifest", "", "Reference manifest JSON")
@@ -102,9 +102,6 @@ func main() {
 	}
 	if *evalDataDir == "" {
 		fail("-eval-data-dir")
-	}
-	if *guardRegistry == "" {
-		fail("-guard-registry")
 	}
 	if *tier == "" {
 		fail("-tier")

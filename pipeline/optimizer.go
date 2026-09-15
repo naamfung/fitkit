@@ -14,6 +14,9 @@ type OptimizationPlan struct {
 	Selected           []UpgradeCandidate
 	SkippedCount       int
 	OracleIterations   int
+	// RefineNote carries the refine_profile record written to plan.json when a
+	// refine profile was applied; nil when none.
+	RefineNote map[string]any
 }
 
 func (p *OptimizationPlan) SelectedCostBytes() int { return p.PredictedSizeBytes - p.LowerSizeBytes }
@@ -191,11 +194,8 @@ func selectPlan(cs *CandidateSet, ordered []UpgradeCandidate, target int) *Optim
 				break
 			}
 		}
+		selected, saved = trimBackSteps(selected, budget)
 		collapsed := collapseSteps(selected)
-		saved = 0
-		for _, c := range collapsed {
-			saved += c.DeltaBytes
-		}
 		return &OptimizationPlan{
 			SchemaVersion: 1, TargetBytes: target, LowerSizeBytes: cs.LowerSizeBytes,
 			PredictedSizeBytes: cs.UpperSizeBytes - saved, UnusedBytes: budget - saved,
@@ -229,6 +229,66 @@ func selectPlan(cs *CandidateSet, ordered []UpgradeCandidate, target int) *Optim
 		PredictedSizeBytes: target - remaining, UnusedBytes: remaining,
 		Selected: collapsed, SkippedCount: cs.TensorCount - len(collapsed),
 	}
+}
+
+// trimBackSteps restores the most valuable selected ladder steps while the
+// remaining savings still cover the budget (predicted size never drops below
+// the target). Unlike whole-tensor rollback it operates on the step sequence
+// BEFORE collapsing, so a tensor can be rolled back one ladder step at a time —
+// the finest granularity the candidate ladder offers. This closes the leftover
+// budget gap (e.g. a 40+ MiB over-degrade) that whole-tensor rollback cannot
+// fill when every remaining tensor's delta exceeds the gap. It recomputes and
+// returns the total bytes saved by the (possibly reduced) selection. Used by
+// every down-mode path so overshoot handling is consistent.
+func trimBackSteps(selected []UpgradeCandidate, budget int) ([]UpgradeCandidate, int) {
+	byTensor := map[string][]UpgradeCandidate{}
+	for _, c := range selected {
+		byTensor[c.Tensor] = append(byTensor[c.Tensor], c)
+	}
+	saved := 0
+	for _, steps := range byTensor {
+		for _, c := range steps {
+			saved += c.DeltaBytes
+		}
+	}
+	if saved <= budget {
+		return selected, saved
+	}
+	for {
+		// candidates: each tensor's deepest taken step (rolling a tensor back
+		// starts at its deepest step)
+		var candidates []UpgradeCandidate
+		for _, steps := range byTensor {
+			if len(steps) == 0 {
+				continue
+			}
+			candidates = append(candidates, steps[len(steps)-1])
+		}
+		if len(candidates) == 0 {
+			break
+		}
+		sortUpgrade(candidates, lessUtilexists)
+		progressed := false
+		for _, cand := range candidates {
+			if saved-cand.DeltaBytes < budget {
+				// rolling this step back would push the predicted size below the
+				// target; a smaller step elsewhere may still fit the gap
+				continue
+			}
+			saved -= cand.DeltaBytes
+			steps := byTensor[cand.Tensor]
+			byTensor[cand.Tensor] = steps[:len(steps)-1]
+			progressed = true
+		}
+		if !progressed {
+			break
+		}
+	}
+	out := make([]UpgradeCandidate, 0, len(selected))
+	for _, steps := range byTensor {
+		out = append(out, steps...)
+	}
+	return out, saved
 }
 
 func optimizeGreedy(target int, cs *CandidateSet) (*OptimizationPlan, error) {
@@ -345,36 +405,13 @@ func optimizeBlockBalanced(target int, cs *CandidateSet, blockSpan int) (*Optimi
 				break
 			}
 		}
+		// Step-level rollback: the per-group quotas can collectively overshoot
+		// the budget (when a group's total savings barely exceed its quota it
+		// consumes every candidate). Restore the most valuable selected ladder
+		// steps while the remaining savings still cover the budget, so only what
+		// the target strictly requires is sacrificed.
+		selected, saved = trimBackSteps(selected, budget)
 		collapsed := collapseSteps(selected)
-		saved = 0
-		for _, c := range collapsed {
-			saved += c.DeltaBytes
-		}
-		// Trim back: the per-group quotas can collectively overshoot the budget
-		// (when a group's total savings barely exceed its quota it consumes every
-		// candidate, leaving nothing at the upper preset). Restore the most
-		// valuable selected tensors to the upper preset while the remaining
-		// savings still cover the budget, so only what the target strictly
-		// requires is sacrificed.
-		if saved > budget {
-			removed := map[string]bool{}
-			for _, c := range sortedCandidates(collapsed, lessUtilexists) {
-				if saved-c.DeltaBytes < budget {
-					break
-				}
-				saved -= c.DeltaBytes
-				removed[c.Tensor] = true
-			}
-			if len(removed) > 0 {
-				var kept []UpgradeCandidate
-				for _, c := range collapsed {
-					if !removed[c.Tensor] {
-						kept = append(kept, c)
-					}
-				}
-				collapsed = kept
-			}
-		}
 		remaining = budget - saved
 		return &OptimizationPlan{
 			SchemaVersion: 1, TargetBytes: target, LowerSizeBytes: cs.LowerSizeBytes,

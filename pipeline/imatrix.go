@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	gguf "fitgo/gguf"
+	gguf "fitting/gguf"
 )
 
 const (

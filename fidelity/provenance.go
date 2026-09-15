@@ -91,16 +91,11 @@ func VerifyEvalV1Provenance(refsDir, evalDataDir, freezePath, referenceManifestP
 	if err != nil {
 		return nil, err
 	}
-	// freeze_conditions.reference_regeneration.manifest_sha256_prefix
-	var recordedPrefix string
-	if fc, ok := freeze["freeze_conditions"].(map[string]any); ok {
-		if rr, ok := fc["reference_regeneration"].(map[string]any); ok {
-			recordedPrefix = fstring(rr["manifest_sha256_prefix"])
-		}
-	}
-	if recordedPrefix != "" && !strings.HasPrefix(manifestSHA, recordedPrefix) {
-		return nil, evalProvenanceErrf("%s: sha256 %s… does not match the freeze-recorded prefix %s — the manifest is not bound to this freeze", referenceManifestPath, manifestSHA[:16], recordedPrefix)
-	}
+	// freeze_conditions.reference_regeneration.manifest_sha256_prefix is a
+	// historical v0.2 bootstrap record and is NOT enforced (0.3.2): a freeze
+	// states how to measure and must cover any model, while per-model trust is
+	// the Fidelity Registry's job (it pins each released manifest by full
+	// SHA-256, keyed by source weights).
 	sourcePin := fstring(manifest["source_bf16_gguf_sha256"])
 	if sourcePin == "" || len(sourcePin) != 64 {
 		return nil, evalProvenanceErrf("%s: missing/invalid source_bf16_gguf_sha256 — references must be bound to the generating weights", referenceManifestPath)

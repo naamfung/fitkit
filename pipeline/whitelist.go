@@ -27,3 +27,21 @@ var PresetFileTypes = map[string]int{
 	// TQ/ternary — the whole TQ family is disabled: TQ4_1S measured garbage
 	// output, and the encoding path proved unstable under local disk loads.
 }
+
+// NameableFileTypes is the subset of PresetFileTypes whose names GGUF
+// file-name readers (e.g. Hugging Face's quantisation-variant panel) actually
+// recognise as presets. The bare tensor-type aliases Q3_K/Q4_K/Q5_K are
+// excluded: llama.cpp ships only the _S/_M/_L variants, so a file named
+// "…-Q4_K.gguf" is dropped from such a listing entirely. Mirrors upstream
+// fit_gguf.PRESET_FILE_TYPES (v0.3.3).
+var NameableFileTypes = map[string]bool{
+	"IQ1_S": true, "IQ1_M": true,
+	"IQ2_XXS": true, "IQ2_XS": true, "IQ2_S": true, "IQ2_M": true,
+	"IQ3_XXS": true, "IQ3_XS": true, "IQ3_S": true, "IQ3_M": true,
+	"IQ4_NL": true, "IQ4_XS": true,
+	"Q2_K": true, "Q2_K_S": true,
+	"Q3_K_S": true, "Q3_K_M": true, "Q3_K_L": true,
+	"Q4_K_S": true, "Q4_K_M": true,
+	"Q5_K_S": true, "Q5_K_M": true,
+	"Q6_K": true, "Q8_0": true,
+}

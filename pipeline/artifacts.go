@@ -38,6 +38,12 @@ type PlanRecord struct {
 	DominantQtype      string
 	QtypeShares        map[string]float64
 	SuggestedFilename  string
+	// RefineNote is the refine_profile record (nil when no refine profile was
+	// applied), mirroring upstream pipeline.plan's refine_note.
+	RefineNote map[string]any
+	// FidelityNote is the fidelity tier record (nil when no tier was claimed),
+	// mirroring upstream pipeline.plan's fidelity note.
+	FidelityNote map[string]any
 }
 
 // WritePlanJSON writes the schema-v1 plan record to path.
@@ -72,8 +78,8 @@ func WritePlanJSON(r PlanRecord, path string) error {
 		"model_name":              r.ModelName,
 		"dominant_qtype":          r.DominantQtype,
 		"qtype_parameter_shares":  r.QtypeShares,
-		"refine_profile":          nil,
-		"fidelity":                nil,
+		"refine_profile":          r.RefineNote,
+		"fidelity":                r.FidelityNote,
 		"suggested_filename":      r.SuggestedFilename,
 	}
 	return writeJSON(path, payload)

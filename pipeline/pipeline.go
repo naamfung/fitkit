@@ -3,30 +3,38 @@ package pipeline
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
-	gguf "fitgo/gguf"
+	gguf "fitting/gguf"
 )
 
 // PresetFileTypes is defined in whitelist.go.
 
 const kvOverrideStringMaxBytes = 127
 
-// RuntimeBinary resolves a llama tool name to an existing file (Windows: .exe).
+// RuntimeBinary resolves a llama tool name to an existing file, mirroring
+// upstream llama_integration.resolve_runtime_binary: on Windows the native
+// .exe/.cmd/.bat forms are tried first (CreateProcess launches .cmd/.bat shims
+// directly), then the extensionless name; on POSIX the extensionless name
+// first, then .exe.
 func RuntimeBinary(runtimeDir, name string) (string, error) {
-	base := filepath.Join(runtimeDir, name)
-	if fileExists(base) {
-		return base, nil
+	candidates := []string{name, name + ".exe"}
+	if runtime.GOOS == "windows" {
+		candidates = []string{name + ".exe", name + ".cmd", name + ".bat", name}
 	}
-	exe := base + ".exe"
-	if fileExists(exe) {
-		return exe, nil
+	for _, c := range candidates {
+		p := filepath.Join(runtimeDir, c)
+		if fileExists(p) {
+			return p, nil
+		}
 	}
-	return "", fmt.Errorf("pipeline: %s not found in %s", name, runtimeDir)
+	return "", fmt.Errorf("pipeline: %s not found in %s (tried: %v)", name, runtimeDir, candidates)
 }
 
 func fileExists(p string) bool {
@@ -181,7 +189,9 @@ func Analyze(source, imatrix, runtimeDir, outDir, lower, upper, imatrixArg strin
 // ------------------------- plan --------------------------------------------
 
 // Plan selects the size-exact recipe and writes plan records + tensor-types.
-func Plan(analysisPath, outPrefix string, targetBytes int, policy string, blockSpan string, modelName string) (*OptimizationPlan, *gguf.Prediction, error) {
+// refineProfile, when non-empty, is a Refine Profile JSON whose C_role /
+// band-cell corrections reweight candidate utility before selection.
+func Plan(analysisPath, outPrefix string, targetBytes int, policy string, blockSpan string, modelName string, refineProfile string) (*OptimizationPlan, *gguf.Prediction, error) {
 	a, err := LoadAnalysis(analysisPath)
 	if err != nil {
 		return nil, nil, err
@@ -197,6 +207,19 @@ func Plan(analysisPath, outPrefix string, targetBytes int, policy string, blockS
 		Direction: a.Direction(),
 	}
 
+	var refineNote map[string]any
+	if refineProfile != "" {
+		profile, err := LoadRefineProfile(refineProfile)
+		if err != nil {
+			return nil, nil, err
+		}
+		usage, err := ApplyRefineCorrections(cs, profile)
+		if err != nil {
+			return nil, nil, err
+		}
+		refineNote = BuildRefineNote(profile, usage)
+	}
+
 	resolvedSpan := a.BlockSpanAuto
 	if blockSpan == "auto" {
 		// keep analysis value
@@ -210,14 +233,21 @@ func Plan(analysisPath, outPrefix string, targetBytes int, policy string, blockS
 	}
 
 	selectOpt := func(t int) (*OptimizationPlan, error) {
+		var opt *OptimizationPlan
+		var err error
 		switch policy {
 		case "original":
-			return optimizeGreedy(t, cs)
+			opt, err = optimizeGreedy(t, cs)
 		case "random":
-			return optimizeRandom(t, cs, "random")
+			opt, err = optimizeRandom(t, cs, "random")
 		default:
-			return optimizeBlockBalanced(t, cs, resolvedSpan)
+			opt, err = optimizeBlockBalanced(t, cs, resolvedSpan)
 		}
+		if err != nil {
+			return nil, err
+		}
+		opt.RefineNote = refineNote
+		return opt, nil
 	}
 
 	optimization, err := selectOpt(targetBytes)
@@ -519,6 +549,17 @@ func ApplyOverrides(lower *Recipe, plan *OptimizationPlan) *Recipe {
 	return out
 }
 
+// qtypeHistogram counts recipe tensors per destination qtype (lowercase),
+// mirroring upstream _qtype_histogram.
+func qtypeHistogram(rec *Recipe) map[string]int {
+	counts := map[string]int{}
+	for i := range rec.Tensors {
+		key := lowerType(rec.Tensors[i].DstType)
+		counts[key]++
+	}
+	return counts
+}
+
 // QtypeParameterDistribution counts parameter elements per destination qtype
 // over the plan-covered tensors of a recipe (see countsInDistribution).
 func QtypeParameterDistribution(rec *Recipe) map[string]int {
@@ -554,6 +595,51 @@ func DominantQtype(dist map[string]int) string {
 		return keys[a] < keys[b]
 	})
 	return strings.ToUpper(keys[0])
+}
+
+// PrimaryTypeFromPlan returns the artifact's PRIMARY TYPE for the release
+// file-name suffix, mirroring upstream primary_type_from_plan (v0.3.3). The
+// suffix must always be a nameable GGUF preset: a tool that reads a file name
+// (Hugging Face's quantisation-variant panel among them) matches it against the
+// set of known preset names, and a file whose suffix is not one of them is
+// dropped from that listing entirely.
+//
+// Three cases, in order:
+//   - selectedCount == 0: no tensor-level override — the artifact IS the
+//     window's lower preset byte for byte, so it is named for that preset.
+//   - dominant qtype is a nameable preset (Q6_K, IQ4_XS, …): the FIT recipe
+//     ships no preset's bytes; the element-weighted dominant type names it.
+//   - dominant qtype is a bare tensor type (Q3_K/Q4_K/Q5_K — llama.cpp only
+//     ships the _S/_M/_L variants): fall back to the base preset, which is also
+//     what general.file_type in the artifact's own metadata claims.
+func PrimaryTypeFromPlan(lowerPreset string, selectedCount int, dominantQtype string) string {
+	lowerName := strings.ToUpper(lowerPreset)
+	if selectedCount <= 0 {
+		return lowerName
+	}
+	dominant := strings.ToUpper(dominantQtype)
+	if dominant != "" && NameableFileTypes[dominant] {
+		return dominant
+	}
+	return lowerName
+}
+
+// ResolveTarget computes the exact integer FIT target: lower + a rational
+// fraction of the preset gap, mirroring upstream resolve_target (Fraction
+// arithmetic with integer truncation). fit accepts forms like "0.5" or "1/3".
+func ResolveTarget(lowerSize, upperSize int, fit string) (int, error) {
+	rat, ok := new(big.Rat).SetString(fit)
+	if !ok {
+		return 0, fmt.Errorf("pipeline: cannot parse --fit %q", fit)
+	}
+	one := big.NewRat(1, 1)
+	if rat.Sign() <= 0 || rat.Cmp(one) >= 0 {
+		return 0, fmt.Errorf("pipeline: --fit must be strictly between 0 and 1, got %s", fit)
+	}
+	gap := big.NewInt(int64(upperSize) - int64(lowerSize))
+	gap.Mul(gap, rat.Num())
+	gap.Quo(gap, rat.Denom()) // Python "//": integer truncation (positive gap)
+	return int(gap.Int64()) + lowerSize, nil
 }
 
 // SuggestedFilename implements the release naming convention. direction is the
@@ -616,16 +702,24 @@ func makeAnalysisDoc(source, imatrix, imatrixArg, runtimeDir, lower, upper, mode
 	if rb, err := RuntimeBinary(runtimeDir, "llama-quantize"); err == nil {
 		quantBin = rb
 	}
+	datasets := profile.Datasets
+	if datasets == nil {
+		datasets = []string{}
+	}
 	return map[string]any{
 		"schema_version":   1,
 		"fit_gguf_version": "0.2.0",
 		"mode":             mode,
 		"source":           map[string]any{"path": source, "size_bytes": fileSize(source), "sha256": nil},
-		"imatrix":          map[string]any{"path": imatrix, "sha256": nil, "arg": imatrixArg},
-		"runtime":          map[string]any{"dir": runtimeDir, "llama_quantize": quantBin},
+		"imatrix": map[string]any{
+			"path": imatrix, "sha256": nil, "arg": imatrixArg,
+			"datasets": datasets, "chunk_count": profile.ChunkCount,
+			"chunk_size": profile.ChunkSize, "entry_count": len(profile.Entries),
+		},
+		"runtime": map[string]any{"dir": runtimeDir, "llama_quantize": quantBin},
 		"presets": map[string]any{
-			"lower": map[string]any{"name": lower, "file_type": PresetFileTypes[lower], "predicted_size_bytes": lowerSize.TotalBytes, "metadata_bytes": lowerSize.MetadataBytes, "tensor_payload_bytes": lowerSize.TensorPayload, "tensor_padding_bytes": lowerSize.TensorPadding},
-			"upper": map[string]any{"name": upper, "file_type": PresetFileTypes[upper], "predicted_size_bytes": upperSize.TotalBytes, "metadata_bytes": upperSize.MetadataBytes, "tensor_payload_bytes": upperSize.TensorPayload, "tensor_padding_bytes": upperSize.TensorPadding},
+			"lower": map[string]any{"name": lower, "file_type": PresetFileTypes[lower], "dry_run_log": "dry-run-" + strings.ToLower(lower) + ".log", "qtype_counts": qtypeHistogram(lowerRecipe), "predicted_size_bytes": lowerSize.TotalBytes, "metadata_bytes": lowerSize.MetadataBytes, "tensor_payload_bytes": lowerSize.TensorPayload, "tensor_padding_bytes": lowerSize.TensorPadding},
+			"upper": map[string]any{"name": upper, "file_type": PresetFileTypes[upper], "dry_run_log": "dry-run-" + strings.ToLower(upper) + ".log", "qtype_counts": qtypeHistogram(upperRecipe), "predicted_size_bytes": upperSize.TotalBytes, "metadata_bytes": upperSize.MetadataBytes, "tensor_payload_bytes": upperSize.TensorPayload, "tensor_padding_bytes": upperSize.TensorPadding},
 		},
 		"metadata": map[string]any{
 			"file_type": meta.FileType, "quantization_version": meta.QuantizationVersion,

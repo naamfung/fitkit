@@ -13,7 +13,7 @@ import (
 	"os"
 	"strconv"
 
-	"fitgo/pipeline"
+	"fitting/pipeline"
 )
 
 func main() {
@@ -34,7 +34,7 @@ func main() {
 	}
 
 	outPrefix := os.TempDir() + string(os.PathSeparator) + "fitgo-plancheck"
-	plan, pred, err := pipeline.Plan(analysisPath, outPrefix, target, policy, "auto", "")
+	plan, pred, err := pipeline.Plan(analysisPath, outPrefix, target, policy, "auto", "", "")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plan error:", err)
 		os.Exit(1)

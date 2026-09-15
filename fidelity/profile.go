@@ -1,6 +1,7 @@
 package fidelity
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -18,25 +18,6 @@ var KLAnchors = map[string]float64{"quality": 0.05, "balanced": 0.10, "compact":
 var tierList = []string{"quality", "balanced", "compact", "mini"}
 var validScopes = map[string]bool{"exact_model": true, "family": true, "architecture": true}
 var validStatuses = map[string]bool{"candidate": true, "validated": true}
-
-const refuseMessage = "Fidelity validation unavailable: No validated Same-top Guard Profile for this model/family. Options: --calibrate-fidelity --experimental-fidelity"
-
-// RequireGuardProfile resolves a validated profile covering modelName for tier,
-// raising the contract refusal (error) when none exists.
-func RequireGuardProfile(modelName, tier, registryDir, sourceSHA256 string) (*GuardProfile, error) {
-	tierKey := strings.TrimSpace(strings.ToLower(tier))
-	if !validTier(tierKey) {
-		return nil, fmt.Errorf("unknown fidelity tier: %q (expected %v)", tier, tierList)
-	}
-	profile, err := ResolveGuardProfile(modelName, registryDir, sourceSHA256)
-	if err != nil {
-		return nil, err
-	}
-	if profile == nil {
-		return nil, fmt.Errorf("%s", refuseMessage)
-	}
-	return profile, nil
-}
 
 func validTier(t string) bool {
 	for _, v := range tierList {
@@ -70,11 +51,51 @@ func canonicalContent(profile map[string]any) (string, error) {
 		}
 		cp[k] = v
 	}
-	data, err := json.Marshal(cp)
-	if err != nil {
+	// Mirror upstream _canonical_content: json.dumps(sort_keys=True,
+	// ensure_ascii=False) with its DEFAULT separators (", ", ": ") — note the
+	// profile hash uses the spaced form, unlike the compact registry digests.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(cp); err != nil {
 		return "", err
 	}
-	return string(data), nil
+	return string(applyPythonDefaultSpacing(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))), nil
+}
+
+// applyPythonDefaultSpacing converts compact JSON to the form json.dumps emits
+// with default separators: ": " after structural colons and ", " after
+// structural commas. String contents are preserved byte for byte.
+func applyPythonDefaultSpacing(b []byte) []byte {
+	out := make([]byte, 0, len(b)+32)
+	inStr := false
+	esc := false
+	for _, c := range b {
+		out = append(out, c)
+		if inStr {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case ':':
+			out = append(out, ' ')
+		case ',':
+			out = append(out, ' ')
+		}
+	}
+	return out
 }
 
 // ProfileHash is sha256 of the canonical content.

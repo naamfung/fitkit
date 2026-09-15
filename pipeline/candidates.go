@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sort"
 
-	gguf "fitgo/gguf"
+	gguf "fitting/gguf"
 )
 
 // UpgradeCandidate is one positive-size lower→upper tensor transition.
@@ -207,7 +207,7 @@ func GenerateUpgradeCandidates(
 // Same-bpw neighbours (e.g. Q4_K vs IQ4_NL) collapse at generation time because
 // they differ by zero bytes per tensor.
 var LadderQtypes = []string{
-	"f32", "bf16",
+	"f32", "f16", "bf16",
 	"q8_0", "q6_k", "q5_k", "q4_k", "iq4_nl", "iq4_xs",
 	"q3_k", "iq3_m", "iq3_s", "iq3_xs", "iq3_xxs",
 	"q2_k", "iq2_m", "iq2_s", "iq2_xs", "iq2_xxs",

@@ -12,8 +12,9 @@ import (
 	"strconv"
 	"strings"
 
-	"fitgo/gguf"
-	"fitgo/pipeline"
+	"fitting/fidelity"
+	"fitting/gguf"
+	"fitting/pipeline"
 )
 
 func parseSize(s string) (int64, error) {
@@ -76,11 +77,25 @@ func autoName(model, dominant string, sizeBytes int64, lower, upper, dirTag stri
 		base = strings.TrimSuffix(base, sfx)
 	}
 
-	// In 'down' mode, dominant should be the upper preset qtype (the starting high-quality qtype).
-	// If dominant is empty, matches the lower preset, or in DOWN mode doesn't match upper,
-	// fallback to the upper preset qtype.
+	// dominant is the headline qtype embedded in the output name:
+	//   - 'down' mode always reports the upper preset (the high-quality base);
+	//   - 'up'   mode keeps the passed dominant (the lower preset base), and is
+	//     never replaced with the upper preset.
 	dominantUpper := strings.ToUpper(upper)
-	if dominant == "" || dominant == strings.ToUpper(lower) || (strings.Contains(dirTag, "DOWN") && dominant != dominantUpper) {
+	switch {
+	case dominant == "":
+		if strings.Contains(dirTag, "DOWN") {
+			if dominantUpper != "" {
+				dominant = dominantUpper
+			} else {
+				dominant = "F16"
+			}
+		} else if lu := strings.ToUpper(lower); lu != "" {
+			dominant = lu
+		} else {
+			dominant = "Q8_0"
+		}
+	case strings.Contains(dirTag, "DOWN") && dominant != dominantUpper:
 		if dominantUpper != "" {
 			dominant = dominantUpper
 		} else {
@@ -138,7 +153,8 @@ func main() {
 	var (
 		bf       = flag.String("source", "", "BF16/f16 source GGUF (required)")
 		im       = flag.String("imatrix", "", "importance-matrix GGUF (required)")
-		targets  = flag.String("target", "", "target size, e.g. 4.8GiB or bytes (required)")
+		targets  = flag.String("target", "", "target size, e.g. 4.8GiB or bytes (alternative: -fit)")
+		fit      = flag.String("fit", "", "fraction of the preset gap, e.g. 0.5 or 1/3 (alternative to -target)")
 		out      = flag.String("out", "", "output path (optional; auto-named if empty)")
 		lower    = flag.String("lower", "Q3_K_M", "lower preset")
 		upper    = flag.String("upper", "Q8_0", "upper preset")
@@ -150,12 +166,15 @@ func main() {
 		allowRQ  = flag.Bool("allow-requantize", false, "allow pre-quantized source (e.g. Q8_0) as parent")
 		noArt    = flag.Bool("no-artifacts", false, "do not emit plan/recipe/profile/quantize-record artifacts next to the output")
 		noLadder = flag.Bool("no-ladder", false, "disable multi-step ladder candidate generation (binary candidates only)")
+		refinePF = flag.String("refine-profile", "", "Refine Profile JSON: re-weight candidate utility by C_role (v0.2)")
+		fidTier  = flag.String("fidelity-tier", "", "Claim a Fidelity tier (quality|balanced|compact|mini); KL-only hard gate, guard optional")
+		guardReg = flag.String("guard-registry", "", "Optional Guard Profile registry directory (supplies the informational Same-top reference)")
 	)
 	flag.Parse()
 	pipeline.AllowRequantize = *allowRQ
 	pipeline.UseLadder = !*noLadder
-	if *bf == "" || *im == "" || *targets == "" {
-		fmt.Fprintln(os.Stderr, "fiting: -bf, -imatrix, -target required (-out optional)")
+	if *bf == "" || *im == "" || (*targets == "" && *fit == "") {
+		fmt.Fprintln(os.Stderr, "fiting: -bf, -imatrix and one of -target/-fit required (-out optional)")
 		os.Exit(2)
 	}
 	bfAbs, _ := filepath.Abs(*bf)
@@ -166,9 +185,13 @@ func main() {
 	if err := mustFile(imAbs); err != nil {
 		fatal(err)
 	}
-	targetBytes, err := parseSize(*targets)
-	if err != nil {
-		fatal(err)
+	var targetBytes int64
+	if *fit == "" {
+		tb, perr := parseSize(*targets)
+		if perr != nil {
+			fatal(perr)
+		}
+		targetBytes = tb
 	}
 
 	work, err := os.MkdirTemp("", "fitgo-work-")
@@ -190,7 +213,11 @@ func main() {
 	fmt.Printf("  source: %s\n", bfAbs)
 	fmt.Printf("  imatrix: %s\n", imAbs)
 	fmt.Printf("  runtime: %s\n", *runtime)
-	fmt.Printf("  target: %s (%d bytes)\n", *targets, targetBytes)
+	if *fit != "" {
+		fmt.Printf("  fit: %s (target resolved after analysis)\n", *fit)
+	} else {
+		fmt.Printf("  target: %s (%d bytes)\n", *targets, targetBytes)
+	}
 	fmt.Printf("  lower: %s\n", *lower)
 	fmt.Printf("  upper: %s\n", *upper)
 	fmt.Printf("  policy: %s\n", *policy)
@@ -203,8 +230,21 @@ func main() {
 	}
 	analysisJSON := filepath.Join(analysisDir, "analysis.json")
 
+	if *fit != "" {
+		a, err := pipeline.LoadAnalysis(analysisJSON)
+		if err != nil {
+			fatal(err)
+		}
+		tb, err := pipeline.ResolveTarget(a.LowerSizeBytes, a.UpperSizeBytes, *fit)
+		if err != nil {
+			fatal(err)
+		}
+		targetBytes = int64(tb)
+		fmt.Printf("  fit %s -> target: %d bytes\n", *fit, targetBytes)
+	}
+
 	fmt.Println("[2/3] plan")
-	optimization, pred, err := pipeline.Plan(analysisJSON, planPrefix, int(targetBytes), *policy, "auto", "")
+	optimization, pred, err := pipeline.Plan(analysisJSON, planPrefix, int(targetBytes), *policy, "auto", "", *refinePF)
 	if err != nil {
 		fatal(err)
 	}
@@ -227,12 +267,30 @@ func main() {
 	dist := pipeline.QtypeParameterDistribution(recipe)
 	dominant := pipeline.DominantQtype(dist)
 
-	// Fix dominant for 'down' mode: it should be the upper preset qtype.
-	// If dominant is empty, matches the lower preset, or in DOWN mode doesn't match upper,
-	// fallback to the upper preset qtype.
+	// dominant is the headline qtype embedded in the output name:
+	//   - 'down' mode always reports the upper preset (the high-quality base);
+	//   - 'up'   mode keeps the plan's dominant qtype, which naturally is the
+	//     lower preset base (e.g. IQ4_XS). It must never be replaced with the
+	//     upper preset — that would mislabel an up-mode output as the upper
+	//     family (e.g. BF16) when it is really IQ4*.
 	dominantUpper := strings.ToUpper(*upper)
 	dirT := dirTag(*mode)
-	if dominant == "" || dominant == strings.ToUpper(*lower) || (strings.Contains(dirT, "DOWN") && dominant != dominantUpper) {
+	switch {
+	case dominant == "":
+		// No plan data: fall back to the direction-appropriate preset.
+		if strings.Contains(dirT, "DOWN") {
+			if dominantUpper != "" {
+				dominant = dominantUpper
+			} else {
+				dominant = "F16"
+			}
+		} else if lu := strings.ToUpper(*lower); lu != "" {
+			dominant = lu
+		} else {
+			dominant = "Q8_0"
+		}
+	case strings.Contains(dirT, "DOWN") && dominant != dominantUpper:
+		// DOWN mode always labels with the upper preset regardless of plan shares.
 		if dominantUpper != "" {
 			dominant = dominantUpper
 		} else {
@@ -259,7 +317,7 @@ func main() {
 
 	recordPath := ""
 	if !*noArt {
-		if err := emitArtifacts(bfAbs, imAbs, analysisJSON, tensorTypes, a, optimization, pred, dist, targetBytes, outPath, *policy, *lower, *upper, dominant, *mode); err != nil {
+		if err := emitArtifacts(bfAbs, imAbs, analysisJSON, tensorTypes, a, optimization, pred, dist, targetBytes, outPath, *policy, *lower, *upper, dominant, *mode, *fidTier, *guardReg); err != nil {
 			fatal(err)
 		}
 		recordPath = outPath + ".quantize-record.json"
@@ -313,7 +371,7 @@ func fatal(err error) {
 func emitArtifacts(bfAbs, imAbs, analysisJSON, tensorTypes string,
 	a *pipeline.Analysis, optimization *pipeline.OptimizationPlan,
 	pred *gguf.Prediction, dist map[string]int, targetBytes int64,
-	outPath, policy, lower, upper, dominant, mode string) error {
+	outPath, policy, lower, upper, dominant, mode, fidTier, guardReg string) error {
 
 	outDir := filepath.Dir(outPath)
 	stem := strings.TrimSuffix(filepath.Base(outPath), ".gguf")
@@ -350,6 +408,39 @@ func emitArtifacts(bfAbs, imAbs, analysisJSON, tensorTypes string,
 
 	// -plan.json
 	mm := pipeline.DefaultModelName(bfAbs)
+
+	// Fidelity Contract v2 (v0.3): a named tier is a KL-only hard gate — a
+	// global, model-independent target, so no Guard Profile is required to name
+	// a tier. When a validated profile covers these exact weights, its
+	// Same-top floor rides along as an informational reference only.
+	var fidelityNote map[string]any
+	if fidTier != "" {
+		tierKey := strings.ToLower(strings.TrimSpace(fidTier))
+		anchor, ok := fidelity.KLAnchors[tierKey]
+		if !ok {
+			return fmt.Errorf("unknown fidelity tier: %q (expected quality|balanced|compact|mini)", fidTier)
+		}
+		var sourceSHA string
+		if sha, err := pipeline.SHA256File(bfAbs); err == nil {
+			sourceSHA = sha
+		}
+		note := map[string]any{"tier": tierKey, "kl_anchor": anchor}
+		profile, err := fidelity.ResolveGuardProfile(mm, guardReg, sourceSHA)
+		if err != nil {
+			return err
+		}
+		if profile != nil {
+			note["same_top_reference"] = profile.FloorFor(tierKey)
+			note["guard_profile_id"] = profile.ProfileID
+			note["source_sha256"] = profile.SourceSHA256
+		} else {
+			note["same_top_reference"] = nil
+			note["guard_profile_id"] = nil
+			note["source_sha256"] = nil
+		}
+		fidelityNote = note
+	}
+
 	record := pipeline.PlanRecord{
 		AnalysisPath:       analysisPath,
 		AnalysisSHA256:     analysisSHA,
@@ -376,6 +467,8 @@ func emitArtifacts(bfAbs, imAbs, analysisJSON, tensorTypes string,
 		DominantQtype:      dominant,
 		QtypeShares:        qtypeShares(dist),
 		SuggestedFilename:  pipeline.SuggestedFilename(mm, int(targetBytes), dominant, dirTag(mode)),
+		RefineNote:         optimization.RefineNote,
+		FidelityNote:       fidelityNote,
 	}
 	return pipeline.WritePlanJSON(record, filepath.Join(outDir, stem+"-plan.json"))
 }

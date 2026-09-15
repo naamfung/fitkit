@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"fitgo/pipeline"
+	"fitting/pipeline"
 )
 
 // PoisonPresets are known poison presets (GPT ruling §12) — never a window
@@ -56,19 +56,26 @@ type RunnerConfig struct {
 	EvalConcurrency int
 }
 
-// ResolveContract builds the dual hard gate: frozen KL Core anchor +
-// validated Guard Profile floor.
+// ResolveContract 构建 KL-only 门限（Fidelity Contract v2）：锚点是全局 KL
+// 常量，命名一个 tier 不需要 validated Guard Profile。当给定 registry 中确有
+// 覆盖该权重的 validated profile 时，其 same-top floor 作为 SameTopReference
+// 附加，仅用于报告。
 func ResolveContract(modelName, tier, guardRegistry, sourceSHA256 string) (*TierContract, error) {
 	tierKey := strings.TrimSpace(strings.ToLower(tier))
-	profile, err := RequireGuardProfile(modelName, tierKey, guardRegistry, sourceSHA256)
-	if err != nil {
-		return nil, err
+	if !validTier(tierKey) {
+		return nil, fmt.Errorf("unknown fidelity tier: %q (expected %v)", tier, tierList)
 	}
-	return &TierContract{
-		Tier:         tierKey,
-		KLAnchor:     KLAnchors[tierKey],
-		SameTopFloor: profile.FloorFor(tierKey),
-	}, nil
+	contract := &TierContract{Tier: tierKey, KLAnchor: KLAnchors[tierKey]}
+	if guardRegistry != "" {
+		profile, err := ResolveGuardProfile(modelName, guardRegistry, sourceSHA256)
+		if err != nil {
+			return nil, err
+		}
+		if profile != nil {
+			contract.SameTopReference = profile.FloorFor(tierKey)
+		}
+	}
+	return contract, nil
 }
 
 // DiscoverWindows loads preset-pair windows from analysis directories.
@@ -433,6 +440,7 @@ func (e *SearchExecutor) planDeliverable(target int, window Window, tag string) 
 		opt, pred, err := pipeline.Plan(
 			filepath.Join(window.AnalysisPath, "analysis.json"),
 			prefix, current, "balanced", "auto", e.Config.ModelName,
+			e.Config.RefineProfile,
 		)
 		if err != nil {
 			return 0, 0, "", err
@@ -465,12 +473,15 @@ func (e *SearchExecutor) planDeliverable(target int, window Window, tag string) 
 // evalDomains runs the five eval-v1 domain evaluations; nil on any failure.
 // Domains are evaluated concurrently (bounded by Config.EvalConcurrency) so the
 // per-domain llama-perplexity model loads overlap instead of loading the model
-// under test serially five times.
+// under test serially five times. Each subprocess gets the runtime environment
+// (own libs + sibling CUDA runtime) so llama.cpp never silently evaluates on
+// CPU because a DLL failed to load.
 func (e *SearchExecutor) evalDomains(artifact, tag string) (map[string]map[string]any, error) {
 	binary, err := pipeline.RuntimeBinary(e.Config.Runtime, "llama-perplexity")
 	if err != nil {
 		return nil, err
 	}
+	env := RuntimeEnv(e.Config.Runtime)
 	conc := e.Config.EvalConcurrency
 	if conc < 1 {
 		conc = 1
@@ -503,7 +514,7 @@ func (e *SearchExecutor) evalDomains(artifact, tag string) (map[string]map[strin
 					"-ngl", "99", "-t", strconv.Itoa(e.Config.Threads),
 					"-c", "512", "-b", "512", "--kl-divergence", "--kl-divergence-base", refFile,
 				}
-				out, rc := execCapture(argv)
+				out, rc := execCapture(argv, env)
 				p, perr := ParseLLaMAKLLog(out)
 				if perr != nil {
 					e.log(fmt.Sprintf("%s: eval %s attempt %d failed (rc=%d); retrying", tag, domain, attempt, rc))
@@ -540,8 +551,9 @@ func (e *SearchExecutor) evalDomains(artifact, tag string) (map[string]map[strin
 	return metrics, nil
 }
 
-func execCapture(argv []string) (string, int) {
+func execCapture(argv []string, env []string) (string, int) {
 	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = env
 	var out strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &out

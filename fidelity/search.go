@@ -10,27 +10,33 @@ import (
 const defaultToleranceBytes = 128 * 1024 * 1024
 
 type TierContract struct {
-	Tier         string
-	KLAnchor     float64
-	SameTopFloor float64
+	Tier     string
+	KLAnchor float64
+	// SameTopReference 是该模型校准的 same-top 参考值（来自 validated Guard
+	// Profile，可选）。仅用于报告（"top-1 91.34% vs 校准 floor 93.16%"），
+	// 永不改变判定。
+	SameTopReference float64
 }
 
+// Passes 是 Fidelity Contract v2（v0.3）的 KL-only 硬门限：macroKL <=
+// KLAnchor 即通过。same-top 仍被测量、记录并归档，但它只是参考，不参与判定。
 func (c TierContract) Passes(macroKL, sameTop float64) bool {
-	return macroKL <= c.KLAnchor && sameTop >= c.SameTopFloor
+	return macroKL <= c.KLAnchor
 }
 
+// Margins 返回 (M_kl, M_top_ref)。M_kl 是唯一约束轴；M_top_ref 仅在已知
+// SameTopReference 时才有意义，无参考值时返回 -1 表示不可用。
 func (c TierContract) Margins(macroKL, sameTop float64) (float64, float64) {
 	mkl := (c.KLAnchor - macroKL) / c.KLAnchor
-	mtop := (sameTop - c.SameTopFloor) / (1.0 - c.SameTopFloor)
-	return mkl, mtop
+	if c.SameTopReference <= 0 {
+		return mkl, -1
+	}
+	return mkl, (sameTop - c.SameTopReference) / (1.0 - c.SameTopReference)
 }
 
+// ActiveConstraint 自 v0.3 起恒为 "kl"：门限只有一条轴。
 func (c TierContract) ActiveConstraint(macroKL, sameTop float64) string {
-	mkl, mtop := c.Margins(macroKL, sameTop)
-	if mkl <= mtop {
-		return "kl"
-	}
-	return "same_top"
+	return "kl"
 }
 
 type SearchPoint struct {
@@ -57,7 +63,7 @@ type Seed struct {
 }
 
 type SearchResult struct {
-	Status           string // verified_pass | budget_exhausted | no_pass | noise_inversion
+	Status           string // verified_pass | budget_exhausted | no_pass | noise_inversion | insufficient_window
 	Best             *SearchPoint
 	Points           []SearchPoint
 	FreshEvals       int

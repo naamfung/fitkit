@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	gguf "fitgo/gguf"
+	gguf "fitting/gguf"
 )
 
 // ---- analysis.json DTO ----------------------------------------------------
