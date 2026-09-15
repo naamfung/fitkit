@@ -31,7 +31,7 @@
 
 ```powershell
 # 编译
-.\build.sh          # 或逐个：go build -o bin/fitting.exe ./cmd/fitting
+./build.sh          # Git Bash / WSL（POSIX shell）；或逐个：go build -o bin/fitting ./cmd/fitting
 
 # 一键量化：源 BF16 → 目标 4.88 GiB，Q3_K_L→F16 窗口，向下优化
 fitting -source model-bf16.gguf -imatrix im.gguf `

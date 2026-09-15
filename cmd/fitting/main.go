@@ -160,7 +160,7 @@ func main() {
 		upper    = flag.String("upper", "Q8_0", "upper preset")
 		policy   = flag.String("policy", "balanced", "plan policy")
 		mode     = flag.String("mode", "up", "optimization direction: up (lower→upper, keep high value) or down (upper→lower, keep high quality)")
-		runtime  = flag.String("runtime", `D:\Programs\llama-cpp-repos\laamaafung\build-v17\bin\Release`, "runtime dir")
+		runtime  = flag.String("runtime", os.Getenv("FITKIT_RUNTIME"), "llama.cpp runtime dir (or set FITKIT_RUNTIME)")
 		keep     = flag.Bool("keep", false, "keep work dir")
 		planOnly = flag.Bool("plan-only", false, "plan + print qtype shares without quantizing")
 		allowRQ  = flag.Bool("allow-requantize", false, "allow pre-quantized source (e.g. Q8_0) as parent")
@@ -175,6 +175,10 @@ func main() {
 	pipeline.UseLadder = !*noLadder
 	if *bf == "" || *im == "" || (*targets == "" && *fit == "") {
 		fmt.Fprintln(os.Stderr, "fitting: -bf, -imatrix and one of -target/-fit required (-out optional)")
+		os.Exit(2)
+	}
+	if *runtime == "" {
+		fmt.Fprintln(os.Stderr, "fitting: -runtime is required (llama.cpp binary dir; or set FITKIT_RUNTIME)")
 		os.Exit(2)
 	}
 	bfAbs, _ := filepath.Abs(*bf)
