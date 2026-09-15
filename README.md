@@ -1,6 +1,6 @@
-# fitting — FIT-GGUF 纯 Go 移植版
+# fitkit — FIT-GGUF 量化工具集（纯 Go 移植版）
 
-`fitting` 是 [FIT-GGUF](https://github.com/Scorp1o117/FIT-GGUF) 算法的**纯 Go 实现**：在 Go 内完成 **analyze → plan → quantize** 全流程，只调用 llama.cpp 运行时（`llama-quantize` / `llama-imatrix` / `llama-perplexity`），**不依赖 Python**。
+[fitkit](https://github.com/naamfung/fitkit) 是以 [FIT-GGUF](https://github.com/Scorp1o117/FIT-GGUF) 算法为核心的量化工具集；本仓库是其**纯 Go 移植版**，命令名 `fitting`：在 Go 内完成 **analyze → plan → quantize** 全流程，只调用 llama.cpp 运行时（`llama-quantize` / `llama-imatrix` / `llama-perplexity`），**不依赖 Python**。
 
 移植基于上游 0.2.0 算法，并吸收 0.3.x 的行为改进（KL-only 保真门限、可命名 preset 的产物命名、按模型的 reference manifest 发现、calibrate/registry 产线等），同时保留 Go 版自有的扩展（up/down 双向优化、多级阶梯候选、并行评估）。
 
