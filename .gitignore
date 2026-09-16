@@ -17,6 +17,7 @@ coverage.out
 
 # Dependency directories (if any are checked in)
 vendor/
+bin/
 
 # Go workspace files
 go.work

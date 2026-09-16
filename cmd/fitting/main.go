@@ -198,7 +198,7 @@ func main() {
 		targetBytes = tb
 	}
 
-	work, err := os.MkdirTemp("", "fitgo-work-")
+	work, err := os.MkdirTemp("", "fitkit-work-")
 	if err != nil {
 		fatal(err)
 	}

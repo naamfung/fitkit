@@ -33,7 +33,7 @@ func main() {
 		policy = os.Args[4]
 	}
 
-	outPrefix := os.TempDir() + string(os.PathSeparator) + "fitgo-plancheck"
+	outPrefix := os.TempDir() + string(os.PathSeparator) + "fitkit-plancheck"
 	plan, pred, err := pipeline.Plan(analysisPath, outPrefix, target, policy, "auto", "", "")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plan error:", err)
